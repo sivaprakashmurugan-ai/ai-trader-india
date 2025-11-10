@@ -76,3 +76,4 @@ This project is a systematic, model-driven paper trading system for the Indian N
 
 \*   `frontend`: React-based dashboard to visualize PnL, positions, and trades.
 
+>>>>>>> e350197804e59c3df1a0f0020dade269adaafb7c
