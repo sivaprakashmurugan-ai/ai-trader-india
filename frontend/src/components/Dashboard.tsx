@@ -5,7 +5,6 @@ import TradeTape from './TradeTape';
 import PnLChart from './PnLChart';
 
 const Dashboard = () => {
-    // TODO: Fetch data from API endpoints
     return (
         <div className="space-y-6">
             <SummaryBar />

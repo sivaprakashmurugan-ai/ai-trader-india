@@ -1,4 +1,11 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
+
+interface DashboardSummary {
+    daily_realized_pnl: number;
+    unrealized_pnl: number;
+    exposure: number;
+    trade_count: number;
+}
 
 const StatCard = ({ title, value, colorClass = 'text-white' }: { title: string, value: string | number, colorClass?: string }) => (
     <div className="bg-gray-800 p-4 rounded-lg shadow">
@@ -8,21 +15,33 @@ const StatCard = ({ title, value, colorClass = 'text-white' }: { title: string, 
 );
 
 const SummaryBar = () => {
-    // TODO: Replace with data from API
-    const summary = {
-        pnl: 120.15,
-        trades: 12,
-        winRate: "66.7%",
-        exposure: "₹25,123.50"
+    const [summary, setSummary] = useState<DashboardSummary | null>(null);
+
+    const fetchSummary = async () => {
+        try {
+            const response = await fetch('/api/dashboard/summary');
+            const data: DashboardSummary = await response.json();
+            setSummary(data);
+        } catch (error) {
+            console.error("Failed to fetch summary:", error);
+        }
     };
-    const pnlColor = summary.pnl >= 0 ? 'text-green-500' : 'text-red-500';
+
+    useEffect(() => {
+        fetchSummary();
+        const interval = setInterval(fetchSummary, 5000); // Poll every 5 seconds
+        return () => clearInterval(interval);
+    }, []);
+
+    const totalPnl = (summary?.daily_realized_pnl || 0) + (summary?.unrealized_pnl || 0);
+    const pnlColor = totalPnl >= 0 ? 'text-green-500' : 'text-red-500';
 
     return (
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-            <StatCard title="Today's PnL (Net)" value={`₹${summary.pnl.toFixed(2)}`} colorClass={pnlColor} />
-            <StatCard title="Total Trades" value={summary.trades} />
-            <StatCard title="Win Rate" value={summary.winRate} />
-            <StatCard title="Current Exposure" value={summary.exposure} />
+            <StatCard title="Today's PnL (Total)" value={summary ? `₹${totalPnl.toFixed(2)}` : 'Loading...'} colorClass={pnlColor} />
+            <StatCard title="Total Trades" value={summary ? summary.trade_count : 'Loading...'} />
+            <StatCard title="Win Rate" value={"N/A"} />
+            <StatCard title="Current Exposure" value={summary ? `₹${summary.exposure.toLocaleString('en-IN')}` : 'Loading...'} />
         </div>
     );
 };

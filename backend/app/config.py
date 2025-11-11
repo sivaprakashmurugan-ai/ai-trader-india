@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     MAX_TRADES_PER_DAY: int = 25
     MAX_TRADES_PER_SYMBOL_PER_DAY: int = 5
     COMMISSION_BPS: int = 4
+    #ALPHA_VANTAGE_API_KEY: str
 
     @property
     def TICKER_LIST(self) -> List[str]:
