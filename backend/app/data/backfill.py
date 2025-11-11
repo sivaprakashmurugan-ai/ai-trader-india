@@ -14,31 +14,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def fetch_historical_data_yfinance(symbol: str, days: int, interval_minutes: int) -> pd.DataFrame:
-    """Fetches historical intraday data from yfinance."""
-    logger.info(f"Fetching last {days} days of {interval_minutes}-min data for {symbol} from yfinance...")
+    """Fetches and robustly cleans historical intraday data from yfinance."""
+    logger.info(f"Fetching last {days} days of {interval_minutes}-min data for {symbol}...")
     interval_str = f"{interval_minutes}m"
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days)
     
     try:
         data = yf.download(
             tickers=symbol,
-            start=start_date,
-            end=end_date,
+            period=f"{days}d",
             interval=interval_str,
             auto_adjust=True,
             progress=False
         )
         if data.empty:
-            logger.warning(f"No data returned for {symbol} from yfinance.")
+            logger.warning(f"No data returned for {symbol}. It may be an ETF or delisted.")
             return pd.DataFrame()
 
         data.reset_index(inplace=True)
-        # Standardize column names
         data.rename(columns={"Datetime": "ts", "Open": "open", "High": "high",
                              "Low": "low", "Close": "close", "Volume": "volume"}, inplace=True)
         
-        # Ensure 'ts' is timezone-aware and standardized to UTC
         if data['ts'].dt.tz is None:
             data['ts'] = data['ts'].dt.tz_localize('UTC')
         else:
@@ -47,7 +42,8 @@ def fetch_historical_data_yfinance(symbol: str, days: int, interval_minutes: int
         data['symbol'] = symbol
         return data[['symbol', 'ts', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
-        logger.error(f"Error fetching data for {symbol} from yfinance: {e}")
+        # yfinance often throws errors for valid requests, we just log and continue
+        logger.error(f"An exception occurred fetching data for {symbol}: {e}")
         return pd.DataFrame()
 
 def upsert_bars(db: Session, bars_df: pd.DataFrame):
@@ -59,26 +55,23 @@ def upsert_bars(db: Session, bars_df: pd.DataFrame):
     db.commit()
     logger.info(f"Upserted {len(bars_df)} historical bars for symbol {bars_df['symbol'].iloc[0]}.")
 
-def run_backfill():
-    """Runs the historical data backfill for all symbols in the universe."""
+def main():
+    logger.info("--- Starting historical data backfill process ---")
     db = SessionLocal()
     try:
-        # Note: yfinance requires .NS suffix for NSE stocks
-        symbols_with_suffix = [f"{ticker}.NS" for ticker in settings.TICKER_LIST]
-        
-        for symbol in symbols_with_suffix:
-            # yfinance can sometimes fail due to IP blocks. We will be persistent.
+        # Use the symbols directly from settings, as they are now in the correct .NS format
+        for symbol in settings.TICKER_LIST:
             bars_df = fetch_historical_data_yfinance(
                 symbol,
                 days=settings.HISTORICAL_DAYS_TO_FETCH,
                 interval_minutes=settings.BAR_INTERVAL_MINUTES
             )
             upsert_bars(db, bars_df)
-            time.sleep(5) # Sleep to be polite to the yfinance servers
+            time.sleep(5) # Be polite to Yahoo's servers
             
-        logger.info("Historical data backfill process complete.")
+        logger.info("--- Historical data backfill process complete ---")
     finally:
         db.close()
 
 if __name__ == "__main__":
-    run_backfill()
+    main()
