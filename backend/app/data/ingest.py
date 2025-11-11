@@ -1,79 +1,85 @@
-import yfinance as yf
-import pandas as pd
-from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert
+import os, time, pandas as pd, yfinance as yf
+from sqlalchemy import create_engine, text
 import logging
-import time
-from datetime import datetime, timedelta
 
-from app.db.base import SessionLocal
-from app.db.models import Bar
-from app.config import settings
+from app.config import settings # Use our project's config
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def fetch_latest_bar(symbol: str, interval_minutes: int) -> pd.DataFrame:
-    """Fetches the most recent intraday bar from yfinance."""
-    logger.info(f"Fetching latest {interval_minutes}-min bar for {symbol}...")
-    interval_str = f"{interval_minutes}m"
-    # Fetch data for the last 2 days to ensure we get the most recent trading day
-    period = "2d"
-    
-    try:
-        data = yf.download(
-            tickers=symbol,
-            period=period,
-            interval=interval_str,
-            auto_adjust=True,
-            progress=False
-        )
-        if data.empty:
-            logger.warning(f"No data returned for {symbol}.")
-            return pd.DataFrame()
+# Use settings from our config object
+engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+UNIVERSE = settings.TICKER_LIST
+INTERVAL = f"{settings.BAR_INTERVAL_MINUTES}m"
+LOOP_SECONDS = settings.INGEST_LOOP_SLEEP_SECONDS
 
-        # Get the very last row
-        latest = data.iloc[[-1]].reset_index()
-        
-        latest.rename(columns={"Datetime": "ts", "Open": "open", "High": "high",
-                               "Low": "low", "Close": "close", "Volume": "volume"}, inplace=True)
-        
-        if latest['ts'].dt.tz is None:
-            latest['ts'] = latest['ts'].dt.tz_localize('UTC')
-        else:
-            latest['ts'] = latest['ts'].dt.tz_convert('UTC')
-            
-        latest['symbol'] = symbol
-        return latest[['symbol', 'ts', 'open', 'high', 'low', 'close', 'volume']]
-    except Exception as e:
-        logger.error(f"Error fetching latest bar for {symbol}: {e}")
-        return pd.DataFrame()
+def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    df = df.reset_index()
+    ts_col = next((c for c in ("Datetime","Date","index") if c in df.columns), df.columns[0])
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = ["_".join([str(x) for x in t if x and str(x)!='nan']) for t in df.columns]
+    out = pd.DataFrame()
+    out["ts"] = pd.to_datetime(df[ts_col], errors="coerce")
+    def pick(prefixes, default=None):
+        cands = [c for c in df.columns if any(c.lower().startswith(p) for p in prefixes)]
+        return pd.to_numeric(df[cands[0]], errors="coerce") if cands else default
+    close = pick(["close","adj close","adj_close"])
+    if close is None: return pd.DataFrame()
+    out["close"]  = close
+    out["open"]   = pick(["open"], default=out["close"])
+    out["high"]   = pick(["high"], default=out["close"])
+    out["low"]    = pick(["low"],  default=out["close"])
+    vol = pick(["volume"], default=0)
+    out["volume"] = vol if vol is not None else 0
+    return out.dropna(subset=["ts","close"])
 
-def upsert_bars(db: Session, bars_df: pd.DataFrame):
-    if bars_df.empty: return
-    table = Bar.__table__
-    stmt = insert(table).values(bars_df.to_dict(orient='records'))
-    stmt = stmt.on_conflict_do_nothing(index_elements=['symbol', 'ts'])
-    db.execute(stmt)
-    db.commit()
-    logger.info(f"Upserted 1 bar for symbol {bars_df['symbol'].iloc[0]} at {bars_df['ts'].iloc[0]}.")
+def upsert_all_once():
+    for sym in UNIVERSE:
+        try:
+            # Using the successful parameter combination from your friend's script
+            data = yf.download(
+                tickers=sym, period="30d", interval=INTERVAL,
+                progress=False, auto_adjust=False, actions=False,
+                threads=False, group_by="column"
+            )
+            norm = normalize_df(data)
+            if norm.empty:
+                logger.warning(f"[Ingestor] No usable data for {sym}")
+                continue
+            with engine.begin() as conn:
+                # Use a more efficient bulk insert
+                insert_data = []
+                for _, r in norm.iterrows():
+                    insert_data.append({
+                        "s": sym, "ts": pd.to_datetime(r["ts"]).to_pydatetime(),
+                        "o": float(r["open"]), "h": float(r["high"]),
+                        "l": float(r["low"]),  "c": float(r["close"]),
+                        "v": int(r.get("volume", 0) or 0),
+                    })
+                
+                if insert_data:
+                    conn.execute(text("""
+                        INSERT INTO bars(symbol, ts, open, high, low, close, volume)
+                        VALUES (:s, :ts, :o, :h, :l, :c, :v)
+                        ON CONFLICT (symbol, ts) DO NOTHING
+                    """), insert_data)
+            logger.info(f"[Ingestor] {sym} upsert ok ({len(norm)} rows)")
+        except Exception as e:
+            logger.error(f"[Ingestor] Error processing {sym}: {e}")
 
-def run_ingest_cycle(db: Session):
-    """Main loop for the live ingestor."""
-    logger.info("--- Starting new ingestion cycle ---")
-    for symbol in settings.TICKER_LIST:
-        bars_df = fetch_latest_bar(symbol, settings.BAR_INTERVAL_MINUTES)
-        upsert_bars(db, bars_df)
-        time.sleep(2) # Brief pause between symbols
-    logger.info("--- Ingestion cycle complete ---")
+# This snapshot logic is brilliant, let's keep it.
+def snapshot_pnl_tick():
+    # ... (Your friend's snapshot code can be pasted here directly if needed)
+    pass # For now, we focus on ingestion.
+
+def main():
+    logger.info("--- Starting yfinance live ingestor ---")
+    while True:
+        upsert_all_once()
+        # snapshot_pnl_tick()
+        logger.info(f"Ingestion cycle complete. Sleeping for {LOOP_SECONDS} seconds.")
+        time.sleep(LOOP_SECONDS)
 
 if __name__ == "__main__":
-    db = SessionLocal()
-    try:
-        logger.info("Starting live ingestion loop using yfinance...")
-        while True:
-            run_ingest_cycle(db)
-            logger.info(f"Sleeping for {settings.INGEST_LOOP_SLEEP_SECONDS} seconds.")
-            time.sleep(settings.INGEST_LOOP_SLEEP_SECONDS)
-    finally:
-        db.close()
+    main()
