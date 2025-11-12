@@ -3,6 +3,7 @@ import logging
 import pandas as pd
 import pytz
 from sqlalchemy import create_engine, text
+from sqlalchemy.orm import Session
 from datetime import datetime, time as dt_time, timedelta
 import joblib
 
