@@ -1,10 +1,10 @@
-import yfinance as yf
 import pandas as pd
-from sqlalchemy.orm import Session
-from sqlalchemy.dialects.postgresql import insert
+from pynse import NSE
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import date, timedelta
+from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert
 
 from app.db.base import SessionLocal
 from app.db.models import Bar
@@ -13,37 +13,31 @@ from app.config import settings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-def fetch_historical_data_yfinance(symbol: str, days: int, interval_minutes: int) -> pd.DataFrame:
-    """Fetches and robustly cleans historical intraday data from yfinance."""
-    logger.info(f"Fetching last {days} days of {interval_minutes}-min data for {symbol}...")
-    interval_str = f"{interval_minutes}m"
-    
-    try:
-        data = yf.download(
-            tickers=symbol,
-            period=f"{days}d",
-            interval=interval_str,
-            auto_adjust=True,
-            progress=False
-        )
-        if data.empty:
-            logger.warning(f"No data returned for {symbol}. It may be an ETF or delisted.")
-            return pd.DataFrame()
+try:
+    nse = NSE()
+    logger.info("pynse NSE session initialized for backfill.")
+except Exception as e:
+    logger.critical(f"Failed to initialize pynse: {e}")
+    nse = None
 
-        data.reset_index(inplace=True)
-        data.rename(columns={"Datetime": "ts", "Open": "open", "High": "high",
-                             "Low": "low", "Close": "close", "Volume": "volume"}, inplace=True)
+def fetch_historical_data(symbol: str, days: int) -> pd.DataFrame:
+    if not nse: return pd.DataFrame()
+    logger.info(f"--- Fetching {days} days of historical data for: {symbol} ---")
+    try:
+        end_date = date.today()
+        start_date = end_date - timedelta(days=days)
+        df = nse.get_hist(symbol, from_date=start_date, to_date=end_date)
         
-        if data['ts'].dt.tz is None:
-            data['ts'] = data['ts'].dt.tz_localize('UTC')
-        else:
-            data['ts'] = data['ts'].dt.tz_convert('UTC')
-            
-        data['symbol'] = symbol
-        return data[['symbol', 'ts', 'open', 'high', 'low', 'close', 'volume']]
+        if df.empty:
+            logger.warning(f"No historical data returned for {symbol}.")
+            return pd.DataFrame()
+        df.reset_index(inplace=True)
+        df.rename(columns={'Date': 'ts', 'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'}, inplace=True)
+        df['symbol'] = f"{symbol}.NS"
+        df['ts'] = pd.to_datetime(df['ts']).dt.tz_localize('UTC')
+        return df[['symbol', 'ts', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
-        # yfinance often throws errors for valid requests, we just log and continue
-        logger.error(f"An exception occurred fetching data for {symbol}: {e}")
+        logger.error(f"Error fetching historical data for {symbol}: {e}")
         return pd.DataFrame()
 
 def upsert_bars(db: Session, bars_df: pd.DataFrame):
@@ -56,19 +50,15 @@ def upsert_bars(db: Session, bars_df: pd.DataFrame):
     logger.info(f"Upserted {len(bars_df)} historical bars for symbol {bars_df['symbol'].iloc[0]}.")
 
 def main():
-    logger.info("--- Starting historical data backfill process ---")
+    if not nse: exit(1)
     db = SessionLocal()
     try:
-        # Use the symbols directly from settings, as they are now in the correct .NS format
+        logger.info("--- Starting historical data backfill process with pynse ---")
         for symbol in settings.TICKER_LIST:
-            bars_df = fetch_historical_data_yfinance(
-                symbol,
-                days=settings.HISTORICAL_DAYS_TO_FETCH,
-                interval_minutes=settings.BAR_INTERVAL_MINUTES
-            )
-            upsert_bars(db, bars_df)
-            time.sleep(5) # Be polite to Yahoo's servers
-            
+            bars_df = fetch_historical_data(symbol, settings.HISTORICAL_DAYS_TO_FETCH)
+            if not bars_df.empty:
+                upsert_bars(db, bars_df)
+            time.sleep(2)
         logger.info("--- Historical data backfill process complete ---")
     finally:
         db.close()

@@ -1,10 +1,8 @@
 import pandas as pd
-import requests
+from pynse import NSE
 import logging
 import time
 from datetime import datetime
-from urllib.parse import quote
-
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.dialects.postgresql import insert
@@ -16,61 +14,25 @@ from app.config import settings
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- NSE Live Data Configuration ---
-NSE_BASE_URL = "https://www.nseindia.com/"
-NSE_CHART_API_URL = "https://www.nseindia.com/api/chart-databyindex?index={identifier}"
+try:
+    nse = NSE()
+    logger.info("pynse NSE session initialized successfully.")
+except Exception as e:
+    logger.critical(f"Failed to initialize pynse NSE session: {e}")
+    nse = None
 
-# These headers are critical to mimic a real browser session
-HEADERS = {
-    'Host': 'www.nseindia.com',
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/javascript, */*; q=0.01',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-}
-
-def get_nse_session() -> requests.Session:
-    """Initializes a persistent session with the necessary NSE cookies."""
+def fetch_live_data(symbol: str, interval: str) -> pd.DataFrame:
+    if not nse: return pd.DataFrame()
+    logger.info(f"--- Fetching live data for: {symbol} ---")
     try:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        logger.info("Acquiring new NSE session cookies...")
-        session.get(NSE_BASE_URL, timeout=15) # Visit the main page to set cookies
-        logger.info("NSE session is active and cookies are set.")
-        return session
-    except requests.RequestException as e:
-        logger.error(f"Fatal error: Failed to initialize NSE session: {e}")
-        return None
-
-def fetch_live_data_nse(session: requests.Session, symbol: str) -> pd.DataFrame:
-    """Fetches the latest intraday data from the NSE's public chart API."""
-    logger.info(f"--- Processing symbol: {symbol} ---")
-    try:
-        # For standard equities, the identifier is the symbol + "EQN"
-        identifier = f"{quote(symbol)}EQN"
-        url = NSE_CHART_API_URL.format(identifier=identifier)
-
-        # Make the API call
-        response = session.get(url, timeout=15)
-        response.raise_for_status()
-        
-        data = response.json()
-        graph_data = data.get("grapthData", [])
-        if not graph_data:
-            logger.warning(f"No graph data found for {symbol} in NSE response.")
+        df = nse.get_intraday(symbol=symbol, interval=interval)
+        if df.empty:
+            logger.warning(f"No live data returned for {symbol}.")
             return pd.DataFrame()
-
-        df = pd.DataFrame(graph_data, columns=["timestamp", "price"])
-        
-        # This endpoint only provides the close price. We will use it for all OHLC values.
-        df['open'] = df['price']
-        df['high'] = df['price']
-        df['low'] = df['price']
-        df['close'] = df['price']
-        df['volume'] = 0 # Volume is not available from this endpoint
-        df['symbol'] = f"{symbol}.NS" # Store with .NS to match historical data
-        df['ts'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC')
-
+        df.reset_index(inplace=True)
+        df.rename(columns={'timestamp': 'ts'}, inplace=True)
+        df['symbol'] = f"{symbol}.NS"
+        df['ts'] = df['ts'].dt.tz_convert('UTC')
         return df[['symbol', 'ts', 'open', 'high', 'low', 'close', 'volume']]
     except Exception as e:
         logger.error(f"Error fetching live data for {symbol}: {e}")
@@ -86,22 +48,18 @@ def upsert_bars(db: Session, bars_df: pd.DataFrame):
     logger.info(f"Upserted {len(bars_df)} live bars for symbol {bars_df['symbol'].iloc[0]}.")
 
 def main():
-    session = get_nse_session()
-    if not session:
-        exit(1)
-        
+    if not nse: exit(1)
     db = SessionLocal()
     try:
-        logger.info("Starting live ingestion loop with NSE data source...")
+        logger.info("Starting live ingestion loop with pynse...")
         while True:
-            logger.info("--- Starting new ingestion cycle ---")
+            interval = f"{settings.BAR_INTERVAL_MINUTES}minute"
             for symbol in settings.TICKER_LIST:
-                bars_df = fetch_live_data_nse(session, symbol)
+                bars_df = fetch_live_data(symbol, interval)
                 if not bars_df.empty:
                     upsert_bars(db, bars_df)
-                time.sleep(5) # Be polite to the NSE servers
-            
-            logger.info(f"--- Ingestion cycle complete. Sleeping for {settings.INGEST_LOOP_SLEEP_SECONDS} seconds. ---")
+                time.sleep(2)
+            logger.info(f"Ingestion cycle complete. Sleeping for {settings.INGEST_LOOP_SLEEP_SECONDS}s.")
             time.sleep(settings.INGEST_LOOP_SLEEP_SECONDS)
     finally:
         db.close()
