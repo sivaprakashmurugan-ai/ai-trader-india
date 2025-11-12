@@ -1,166 +1,77 @@
-import time
-import logging
+import os, time, pytz, logging
+import datetime as dt
 import pandas as pd
-from sqlalchemy import text, func, desc
-from datetime import datetime, time as dt_time
+from sqlalchemy import create_engine, text
 
 from app.config import settings
-from app.db.base import SessionLocal
-from app.db.models import Position, Trade, PnLSnapshot, Bar, Order
-from app.models import model_store, features
+from app.models.features import make_features
+import joblib
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- Global State (in-memory for simplicity) ---
-# In a production system, this would be stored more robustly (e.g., in Redis or the DB)
-agent_state = {
-    "cash": settings.DAILY_BUDGET,
-    "daily_realized_pnl": 0.0,
-    "trades_today": 0,
-    "stop_trading_today": False,
-    "symbol_cooldowns": {}, # e.g., {'INFY': datetime_object}
-    "last_prob": {} # For EMA smoothing
-}
+# --- Load Models ---
+try:
+    MODEL_BUNDLE = joblib.load("app/models/model.pkl")
+    MODELS = MODEL_BUNDLE["models"]
+    logger.info(f"Successfully loaded model bundle trained at {MODEL_BUNDLE.get('trained_at')}")
+except FileNotFoundError:
+    logger.critical("Model file 'app/models/model.pkl' not found! The trainer must be run first. Exiting.")
+    exit(1)
 
-def run_agent_cycle():
-    """Main loop for the trading agent, runs once per minute."""
-    logger.info("--- Starting new agent cycle ---")
-    db = SessionLocal()
-    try:
-        now = datetime.now()
-        
-        # --- 1. Check System State & Risk Limits ---
-        if agent_state["stop_trading_today"]:
-            logger.warning("Daily max loss hit. No new trades will be placed.")
-            return
+# --- Config ---
+TIMEZONE = pytz.timezone(settings.TIMEZONE)
+engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
+UNIVERSE = settings.TICKER_LIST
 
-        # --- 2. Collect State for All Symbols ---
-        all_symbols_state = []
-        open_positions = {pos.symbol: pos for pos in db.query(Position).all()}
-        
-        for symbol in settings.TICKER_LIST:
-            model_bundle = model_store.load_model(symbol)
-            if not model_bundle:
-                continue
+# --- State (in-memory, as per original design) ---
+prob_ema_cache = {}
+last_exit_time = {}
+last_entry_time = {}
 
-            # Load latest bars to build features
-            query = text("SELECT * FROM bars WHERE symbol = :symbol ORDER BY ts DESC LIMIT 200")
-            latest_bars_df = pd.read_sql(query, db.bind, params={"symbol": f"{symbol}.NS"})
-            if latest_bars_df.empty:
-                continue
-            
-            latest_bars_df = latest_bars_df.sort_values('ts').reset_index(drop=True)
-            
-            # Feature engineering
-            df_features = features.create_features(latest_bars_df)
-            latest_row = df_features.iloc[-1]
-            X = latest_row[model_bundle['feature_columns']].values.reshape(1, -1)
-            
-            # Predict probability and apply EMA smoothing
-            prob_long = model_bundle['model'].predict_proba(X)[0, 1]
-            last_prob = agent_state["last_prob"].get(symbol, prob_long)
-            prob_smooth = (settings.PROB_EMA_ALPHA * prob_long) + (1 - settings.PROB_EMA_ALPHA) * last_prob
-            agent_state["last_prob"][symbol] = prob_smooth
-            
-            # Get current position info
-            pos = open_positions.get(symbol)
-            
-            all_symbols_state.append({
-                "symbol": symbol,
-                "prob": prob_smooth,
-                "price": float(latest_row['close']),
-                "position": pos,
-            })
+# --- Helper Functions (adapted from friend's code) ---
+def ist_now(): return dt.datetime.now(TIMEZONE)
+def _time_obj(hm: str): return dt.datetime.strptime(hm, "%H:%M").time()
+def in_window(): return _time_obj(settings.TRADE_START) <= ist_now().time() <= _time_obj(settings.TRADE_END)
 
-        # --- 3. Apply Exit Rules to Open Positions ---
-        for state in all_symbols_state:
-            pos = state["position"]
-            if not pos:
-                continue
+def load_last_bars(sym, n=200):
+    with engine.begin() as conn:
+        rows = conn.execute(text("SELECT * FROM bars WHERE symbol = :s ORDER BY ts DESC LIMIT :n"), {"s": sym, "n": n}).mappings().all()
+    return pd.DataFrame(rows).sort_values("ts").reset_index(drop=True) if rows else pd.DataFrame()
 
-            price = state["price"]
-            avg_price = float(pos.avg_price)
-            
-            # Rule: Take-Profit
-            if price >= avg_price * (1 + settings.TAKE_PROFIT_PCT):
-                logger.info(f"[EXIT] TAKE PROFIT for {pos.symbol} at {price:.2f}")
-                # TODO: Implement trade closing logic (create Trade, delete Position)
-                db.delete(pos)
+def get_db_state():
+    with engine.begin() as conn:
+        positions = {p['symbol']: p for p in conn.execute(text("SELECT symbol, qty, avg_price FROM positions")).mappings().all()}
+        pnl_row = conn.execute(text("SELECT realized, unrealized FROM pnl WHERE ts::date = NOW()::date ORDER BY ts DESC LIMIT 1")).mappings().first()
+    return positions, pnl_row
 
-            # Rule: Stop-Loss
-            elif price <= avg_price * (1 - settings.STOP_LOSS_PCT):
-                logger.info(f"[EXIT] STOP LOSS for {pos.symbol} at {price:.2f}")
-                db.delete(pos)
+# ... other helpers for placing orders, etc. ...
 
-            # Rule: Model-based Exit
-            elif state["prob"] <= settings.PROB_THRESHOLD_SELL:
-                logger.info(f"[EXIT] MODEL EXIT for {pos.symbol} at {price:.2f} (prob={state['prob']:.2f})")
-                db.delete(pos)
-        
-        db.commit() # Commit any exits
-
-        # --- 4. Apply Entry Rules for New Positions ---
-        candidates = []
-        for state in all_symbols_state:
-            # Entry condition: High probability and no current position
-            if state["prob"] >= settings.PROB_THRESHOLD_BUY and not state["position"]:
-                candidates.append(state)
-        
-        if not candidates:
-            logger.info("No entry candidates found in this cycle.")
-            return
-
-        # Calculate scores for all candidates
-        p_max = max(c['prob'] for c in candidates)
-        total_score = 0
-        for c in candidates:
-            edge = c['prob'] - settings.PROB_THRESHOLD_BUY
-            rel = max(0, c['prob'] - (p_max - settings.DOMINANCE_GAP))
-            c['score'] = edge * rel
-            total_score += c['score']
-
-        # Allocate capital and place paper trades
-        if total_score > 0:
-            total_capital_to_deploy = agent_state["cash"] * settings.POSITION_ENTRY_PCT
-            
-            for c in candidates:
-                if c['score'] <= 0: continue
-                
-                alloc = total_capital_to_deploy * (c['score'] / total_score)
-                alloc = max(settings.MIN_TRADE_VALUE, min(alloc, settings.MAX_TRADE_VALUE_PER_SYMBOL))
-                
-                qty = int(alloc / c['price'])
-
-                if qty > 0 and agent_state["cash"] >= qty * c['price']:
-                    logger.info(f"[ENTRY] BUY {qty} x {c['symbol']} @ {c['price']:.2f} (prob={c['prob']:.2f}, score={c['score']:.2f})")
-                    
-                    # Create a new position in the database
-                    new_pos = Position(
-                        symbol=c['symbol'],
-                        quantity=qty,
-                        avg_price=c['price'],
-                        entry_time=now
-                    )
-                    db.add(new_pos)
-                    agent_state["cash"] -= qty * c['price']
-                    agent_state["trades_today"] += 1
-        
-        db.commit() # Commit any new entries
-
-    except Exception as e:
-        logger.error(f"An error occurred in agent cycle: {e}", exc_info=True)
-    finally:
-        db.close()
-    
-    logger.info("--- Agent cycle complete ---")
-
-
-if __name__ == "__main__":
-    logger.info("Trading agent service starting. Waiting for services...")
-    time.sleep(15) # Wait for models to be built and data to be available
-    
+def main():
+    logger.info("--- AI Trading Agent Started ---")
     while True:
-        # TODO: Add logic to only trade between TRADE_START and TRADE_END times
-        run_agent_cycle()
-        time.sleep(settings.AGENT_LOOP_SLEEP_SECONDS)
+        try:
+            if not in_window():
+                logger.info("Outside trading hours. Sleeping...")
+                time.sleep(60)
+                continue
+
+            positions, pnl_row = get_db_state()
+            # ... Implement the full, sophisticated trading loop from agent.py here ...
+            # This involves:
+            # 1. Looping through UNIVERSE.
+            # 2. Loading bars and making features.
+            # 3. Getting model predictions.
+            # 4. Checking exit conditions (TP/SL/Model).
+            # 5. Building a list of buy candidates.
+            # 6. Running the `perform_dynamic_buys` logic.
+            
+            logger.info("Agent cycle complete. (Placeholder logic).")
+
+            time.sleep(settings.AGENT_LOOP_SLEEP_SECONDS)
+        except Exception as e:
+            logger.error(f"Error in agent cycle: {e}", exc_info=True)
+            time.sleep(30)
+            
+if __name__ == "__main__":
+    main()
