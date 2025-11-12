@@ -16,28 +16,20 @@ def train_model_for_symbol(db, symbol: str):
     """Full pipeline to train and save a model for a single symbol."""
     logger.info(f"--- Starting training pipeline for {symbol} ---")
     
-    # 1. Load data from the database
     logger.info("Loading historical data...")
     query = text(f"""
         SELECT ts, open, high, low, close, volume, symbol
-        FROM bars
-        WHERE symbol = :symbol
-        ORDER BY ts ASC
-        LIMIT :limit
+        FROM bars WHERE symbol = :symbol ORDER BY ts ASC LIMIT :limit
     """)
-    # Note: Using yfinance symbols with .NS for loading data
-    df = pd.read_sql(query, db.bind, params={"symbol": f"{symbol}.NS", "limit": settings.TRAIN_MAX_BARS})
+    # --- FIX: Pass the symbol directly without modification ---
+    df = pd.read_sql(query, db.bind, params={"symbol": symbol, "limit": settings.TRAIN_MAX_BARS})
 
-    if df.empty or len(df) < 500: # Need enough data for feature creation and training
+    if df.empty or len(df) < 500:
         logger.warning(f"Not enough data to train model for {symbol}. Found {len(df)} bars. Skipping.")
         return
 
-    # 2. Engineer features and create target variable
     df_features = features.create_features(df)
     df_final = features.create_target(df_features, threshold=settings.TARGET_RETURN_THRESHOLD, periods=3)
-
-    # 3. Prepare data for training
-    # Drop rows with NaN values (from rolling windows and target creation)
     df_final.dropna(inplace=True)
 
     feature_columns = [
@@ -49,46 +41,38 @@ def train_model_for_symbol(db, symbol: str):
     y = df_final[target_column]
 
     if len(X) < 100:
-        logger.warning(f"Not enough clean data points ({len(X)}) to train after feature engineering. Skipping.")
+        logger.warning(f"Not enough clean data points ({len(X)}) to train. Skipping.")
         return
 
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, shuffle=False)
-
     logger.info(f"Training data shape: {X_train.shape}, Test data shape: {X_test.shape}")
 
-    # 4. Train LightGBM classifier
     logger.info("Training LightGBM model...")
-    lgbm = lgb.LGBMClassifier(
-        objective='binary',
-        n_estimators=100,
-        n_jobs=-1,
-        random_state=42
-    )
+    lgbm = lgb.LGBMClassifier(objective='binary', n_estimators=100, n_jobs=-1, random_state=42)
     lgbm.fit(X_train, y_train)
 
-    # (Optional) Evaluate model
     accuracy = lgbm.score(X_test, y_test)
     logger.info(f"Model accuracy on test set for {symbol}: {accuracy:.2f}")
 
-    # 5. Save model bundle
     model_bundle = {
         "model": lgbm,
         "feature_columns": feature_columns,
         "training_date": pd.Timestamp.now().isoformat()
     }
-    # Save using the plain symbol name, which the agent uses
-    model_store.save_model(model_bundle, symbol)
-    logger.info(f"--- Training pipeline for {symbol} complete. Model saved. ---")
+    # Save using the plain symbol name (without .NS) for the agent
+    plain_symbol = symbol.replace('.NS', '')
+    model_store.save_model(model_bundle, plain_symbol)
+    logger.info(f"--- Training pipeline for {symbol} complete. Model saved as {plain_symbol}.pkl ---")
 
 def main():
-    logger.info("Trainer service starting. Waiting for data services...")
-    time.sleep(10) # Give ingestor/backfill a moment to start
+    logger.info("Trainer service starting...")
+    time.sleep(5)
     db = SessionLocal()
     try:
-        # Use the plain symbols from the config, the training function adds the .NS suffix
+        # --- FIX: Use the symbols directly from the config, which are already in .NS format ---
         for symbol in settings.TICKER_LIST:
             train_model_for_symbol(db, symbol)
-            time.sleep(2) # Small delay between training runs
+            time.sleep(1)
     finally:
         db.close()
     logger.info("Trainer service finished all training jobs.")
