@@ -16,4 +16,4 @@ lightgbm==4.1.0
 ta==0.10.2
 
 # --- The Definitive Data Source Library ---
-pynse==1.1.2
+yfinance==0.2.66
