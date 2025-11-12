@@ -7,6 +7,7 @@ import joblib
 from app.db.base import SessionLocal
 from app.config import settings
 from . import features
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
