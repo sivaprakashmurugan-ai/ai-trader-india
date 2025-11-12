@@ -13,24 +13,37 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    """A robust function to clean yfinance data, inspired by the review code."""
+    """A robust function to clean yfinance data, handling timezone correctly."""
     if df is None or df.empty: return pd.DataFrame()
     df = df.reset_index()
     ts_col = next((c for c in ("Datetime","Date","index") if c in df.columns), df.columns[0])
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join([str(x) for x in t if x]) for t in df.columns]
+    
     out = pd.DataFrame()
-    out["ts"] = pd.to_datetime(df[ts_col], errors="coerce").dt.tz_localize('UTC')
+    
+    # --- FIX: Robust timezone handling ---
+    timestamps = pd.to_datetime(df[ts_col], errors="coerce")
+    if timestamps.dt.tz is None:
+        # Timestamp is naive, so localize it to UTC
+        out["ts"] = timestamps.dt.tz_localize('UTC')
+    else:
+        # Timestamp is already aware, so just convert it to UTC for standardization
+        out["ts"] = timestamps.dt.tz_convert('UTC')
+
     def pick(prefixes, default=None):
         cands = [c for c in df.columns if any(c.lower().startswith(p) for p in prefixes)]
         return pd.to_numeric(df[cands[0]], errors="coerce") if cands else default
+    
     close = pick(["close","adj close"])
     if close is None: return pd.DataFrame()
+    
     out["close"]  = close
     out["open"]   = pick(["open"], default=out["close"])
     out["high"]   = pick(["high"], default=out["close"])
     out["low"]    = pick(["low"],  default=out["close"])
     out["volume"] = pick(["volume"], default=0)
+    
     return out.dropna(subset=["ts","close"])
 
 def fetch_latest_bars(symbol: str) -> pd.DataFrame:
