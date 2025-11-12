@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     TRADE_START_TIME: str = "09:15"
     TRADE_END_TIME: str = "15:00"
     SQUARE_OFF_TIME: str = "15:15"
+    TIMEZONE: str = "Asia/Kolkata"
     AGENT_LOOP_SLEEP_SECONDS: int = 60
     DAILY_BUDGET: float = 100000.00
     DAILY_MAX_LOSS_PCT: float = 0.015
