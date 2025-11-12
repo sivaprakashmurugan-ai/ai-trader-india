@@ -1,85 +1,110 @@
-import os, time, pandas as pd, yfinance as yf
-from sqlalchemy import create_engine, text
+import pandas as pd
+import requests
 import logging
+import time
+from datetime import datetime
+from urllib.parse import quote
 
-from app.config import settings # Use our project's config
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert
+
+from app.db.base import SessionLocal
+from app.db.models import Bar
+from app.config import settings
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Use settings from our config object
-engine = create_engine(settings.DATABASE_URL, pool_pre_ping=True)
-UNIVERSE = settings.TICKER_LIST
-INTERVAL = f"{settings.BAR_INTERVAL_MINUTES}m"
-LOOP_SECONDS = settings.INGEST_LOOP_SLEEP_SECONDS
+# --- NSE Live Data Configuration ---
+NSE_BASE_URL = "https://www.nseindia.com/"
+NSE_CHART_API_URL = "https://www.nseindia.com/api/chart-databyindex?index={identifier}"
 
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return pd.DataFrame()
-    df = df.reset_index()
-    ts_col = next((c for c in ("Datetime","Date","index") if c in df.columns), df.columns[0])
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join([str(x) for x in t if x and str(x)!='nan']) for t in df.columns]
-    out = pd.DataFrame()
-    out["ts"] = pd.to_datetime(df[ts_col], errors="coerce")
-    def pick(prefixes, default=None):
-        cands = [c for c in df.columns if any(c.lower().startswith(p) for p in prefixes)]
-        return pd.to_numeric(df[cands[0]], errors="coerce") if cands else default
-    close = pick(["close","adj close","adj_close"])
-    if close is None: return pd.DataFrame()
-    out["close"]  = close
-    out["open"]   = pick(["open"], default=out["close"])
-    out["high"]   = pick(["high"], default=out["close"])
-    out["low"]    = pick(["low"],  default=out["close"])
-    vol = pick(["volume"], default=0)
-    out["volume"] = vol if vol is not None else 0
-    return out.dropna(subset=["ts","close"])
+# These headers are critical to mimic a real browser session
+HEADERS = {
+    'Host': 'www.nseindia.com',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate, br',
+}
 
-def upsert_all_once():
-    for sym in UNIVERSE:
-        try:
-            # Using the successful parameter combination from your friend's script
-            data = yf.download(
-                tickers=sym, period="30d", interval=INTERVAL,
-                progress=False, auto_adjust=False, actions=False,
-                threads=False, group_by="column"
-            )
-            norm = normalize_df(data)
-            if norm.empty:
-                logger.warning(f"[Ingestor] No usable data for {sym}")
-                continue
-            with engine.begin() as conn:
-                # Use a more efficient bulk insert
-                insert_data = []
-                for _, r in norm.iterrows():
-                    insert_data.append({
-                        "s": sym, "ts": pd.to_datetime(r["ts"]).to_pydatetime(),
-                        "o": float(r["open"]), "h": float(r["high"]),
-                        "l": float(r["low"]),  "c": float(r["close"]),
-                        "v": int(r.get("volume", 0) or 0),
-                    })
-                
-                if insert_data:
-                    conn.execute(text("""
-                        INSERT INTO bars(symbol, ts, open, high, low, close, volume)
-                        VALUES (:s, :ts, :o, :h, :l, :c, :v)
-                        ON CONFLICT (symbol, ts) DO NOTHING
-                    """), insert_data)
-            logger.info(f"[Ingestor] {sym} upsert ok ({len(norm)} rows)")
-        except Exception as e:
-            logger.error(f"[Ingestor] Error processing {sym}: {e}")
+def get_nse_session() -> requests.Session:
+    """Initializes a persistent session with the necessary NSE cookies."""
+    try:
+        session = requests.Session()
+        session.headers.update(HEADERS)
+        logger.info("Acquiring new NSE session cookies...")
+        session.get(NSE_BASE_URL, timeout=15) # Visit the main page to set cookies
+        logger.info("NSE session is active and cookies are set.")
+        return session
+    except requests.RequestException as e:
+        logger.error(f"Fatal error: Failed to initialize NSE session: {e}")
+        return None
 
-# This snapshot logic is brilliant, let's keep it.
-def snapshot_pnl_tick():
-    # ... (Your friend's snapshot code can be pasted here directly if needed)
-    pass # For now, we focus on ingestion.
+def fetch_live_data_nse(session: requests.Session, symbol: str) -> pd.DataFrame:
+    """Fetches the latest intraday data from the NSE's public chart API."""
+    logger.info(f"--- Processing symbol: {symbol} ---")
+    try:
+        # For standard equities, the identifier is the symbol + "EQN"
+        identifier = f"{quote(symbol)}EQN"
+        url = NSE_CHART_API_URL.format(identifier=identifier)
+
+        # Make the API call
+        response = session.get(url, timeout=15)
+        response.raise_for_status()
+        
+        data = response.json()
+        graph_data = data.get("grapthData", [])
+        if not graph_data:
+            logger.warning(f"No graph data found for {symbol} in NSE response.")
+            return pd.DataFrame()
+
+        df = pd.DataFrame(graph_data, columns=["timestamp", "price"])
+        
+        # This endpoint only provides the close price. We will use it for all OHLC values.
+        df['open'] = df['price']
+        df['high'] = df['price']
+        df['low'] = df['price']
+        df['close'] = df['price']
+        df['volume'] = 0 # Volume is not available from this endpoint
+        df['symbol'] = f"{symbol}.NS" # Store with .NS to match historical data
+        df['ts'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC')
+
+        return df[['symbol', 'ts', 'open', 'high', 'low', 'close', 'volume']]
+    except Exception as e:
+        logger.error(f"Error fetching live data for {symbol}: {e}")
+        return pd.DataFrame()
+
+def upsert_bars(db: Session, bars_df: pd.DataFrame):
+    if bars_df.empty: return
+    table = Bar.__table__
+    stmt = insert(table).values(bars_df.to_dict(orient='records'))
+    stmt = stmt.on_conflict_do_nothing(index_elements=['symbol', 'ts'])
+    db.execute(stmt)
+    db.commit()
+    logger.info(f"Upserted {len(bars_df)} live bars for symbol {bars_df['symbol'].iloc[0]}.")
 
 def main():
-    logger.info("--- Starting yfinance live ingestor ---")
-    while True:
-        upsert_all_once()
-        # snapshot_pnl_tick()
-        logger.info(f"Ingestion cycle complete. Sleeping for {LOOP_SECONDS} seconds.")
-        time.sleep(LOOP_SECONDS)
+    session = get_nse_session()
+    if not session:
+        exit(1)
+        
+    db = SessionLocal()
+    try:
+        logger.info("Starting live ingestion loop with NSE data source...")
+        while True:
+            logger.info("--- Starting new ingestion cycle ---")
+            for symbol in settings.TICKER_LIST:
+                bars_df = fetch_live_data_nse(session, symbol)
+                if not bars_df.empty:
+                    upsert_bars(db, bars_df)
+                time.sleep(5) # Be polite to the NSE servers
+            
+            logger.info(f"--- Ingestion cycle complete. Sleeping for {settings.INGEST_LOOP_SLEEP_SECONDS} seconds. ---")
+            time.sleep(settings.INGEST_LOOP_SLEEP_SECONDS)
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     main()
