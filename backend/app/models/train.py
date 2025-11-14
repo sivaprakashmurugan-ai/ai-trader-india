@@ -1,41 +1,25 @@
 import pandas as pd
 import logging, time, os, sys
-from sqlalchemy import create_engine, text
+from sqlalchemy import text
 import lightgbm as lgb
 import joblib
 from datetime import datetime
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score, accuracy_score # Import evaluation metrics
 
+from app.db.base import SessionLocal
 from app.config import settings
+from . import features
 
-# --- Standalone Setup for Robustness ---
-# This script is a self-contained job. It will manage its own DB connection.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Load features functions from the same module
-from . import features
-
-# Use the DATABASE_URL passed into the container environment
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    logger.critical("DATABASE_URL environment variable not set! Exiting.")
-    sys.exit(1)
-
-try:
-    engine = create_engine(DATABASE_URL)
-    logger.info("Database engine created successfully.")
-except Exception as e:
-    logger.critical(f"Failed to create database engine: {e}")
-    sys.exit(1)
-
-
 FEAT_COLS = ["ret_1", "rsi_14", "ma_5", "ma_20", "vwap"]
 
-def train_symbol(symbol: str):
+def train_symbol(db, symbol: str):
     logger.info(f"--- Training for {symbol} ---")
-    
-    with engine.connect() as conn:
-        df = pd.read_sql_query(text("SELECT * FROM bars WHERE symbol = :symbol ORDER BY ts ASC"), conn, params={"symbol": symbol})
+    query = text("SELECT * FROM bars WHERE symbol = :symbol ORDER BY ts ASC")
+    df = pd.read_sql(query, db.bind, params={"symbol": symbol})
 
     if len(df) < 200:
         logger.warning(f"Not enough bars ({len(df)}) for {symbol}. Skipping.")
@@ -47,47 +31,69 @@ def train_symbol(symbol: str):
     if len(X) != len(y) or len(X) < 100:
         logger.warning(f"Feature/label mismatch or insufficient data for {symbol}. Skipping.")
         return None
+    
+    # --- NEW: Proper Train/Test Split ---
+    # We use shuffle=False because this is time-series data. The test set must come after the train set.
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False, random_state=42)
 
-    pos = int((y == 1).sum()); neg = int((y == 0).sum())
+    if len(X_train) < 100 or len(X_test) < 20:
+        logger.warning(f"Not enough data after splitting for {symbol}. Skipping.")
+        return None
+
+    pos = int((y_train == 1).sum()); neg = int((y_train == 0).sum())
     if pos == 0 or neg == 0:
-        logger.warning(f"Only one class found for {symbol}. Skipping.")
+        logger.warning(f"Only one class found in training data for {symbol}. Skipping.")
         return None
     
     pos_wt = neg / pos
-    logger.info(f"Training LGBM for {symbol} ({len(X)} rows, pos_wt={pos_wt:.1f})")
+    logger.info(f"Training LGBM for {symbol} ({len(X_train)} rows, pos_wt={pos_wt:.1f})")
     
     model = lgb.LGBMClassifier(
         n_estimators=300, num_leaves=64, learning_rate=0.05,
         scale_pos_weight=pos_wt, n_jobs=-1, random_state=42
     )
-    model.fit(X.values, y.values)
+    model.fit(X_train.values, y_train.values)
     
+    # --- NEW: Evaluate the Model on Unseen Test Data ---
+    y_pred_prob = model.predict_proba(X_test.values)[:, 1]
+    y_pred_class = model.predict(X_test.values)
+
+    accuracy = accuracy_score(y_test, y_pred_class)
+    auc = roc_auc_score(y_test, y_pred_prob)
+
+    logger.info(f"--- EVALUATION for {symbol} ---")
+    logger.info(f"Test Set Accuracy: {accuracy:.4f}")
+    logger.info(f"Test Set AUC Score: {auc:.4f}")
+    logger.info("-----------------------------")
+
+    # Only save the model if it has at least some predictive power (better than random)
+    if auc < 0.51:
+        logger.warning(f"Model for {symbol} has an AUC of {auc:.4f}, which is too low. Skipping save.")
+        return None
+
     # Save the model using the plain symbol name for the agent
     plain_symbol = symbol.replace('.NS', '')
-    return {plain_symbol: {"model": model, "features": FEAT_COLS}}
+    return {plain_symbol: {"model": model, "features": FEAT_COLS, "auc": auc}}
 
 def main():
-    logger.info("--- Trainer service started ---")
+    db = SessionLocal()
     models = {}
-    
-    # Use the TICKER_LIST from our main project settings
-    for symbol in settings.TICKER_LIST:
-        try:
-            model_bundle = train_symbol(symbol)
+    try:
+        for symbol in settings.TICKER_LIST:
+            model_bundle = train_symbol(db, symbol)
             if model_bundle:
                 models.update(model_bundle)
-        except Exception as e:
-            logger.error(f"An unexpected error occurred while training {symbol}: {e}", exc_info=True)
-            
+    finally:
+        db.close()
+
     if not models:
-        logger.critical("No models were trained. Check data availability and script logic. Exiting.")
+        logger.critical("No models were trained successfully. Exiting.")
         sys.exit(1)
 
     out_path = "app/models/model.pkl"
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     joblib.dump({"models": models, "trained_at": datetime.utcnow().isoformat()}, out_path)
     logger.info(f"Successfully trained and saved {len(models)} models to {out_path}")
-    logger.info("--- Trainer service finished all jobs successfully ---")
 
 if __name__ == "__main__":
     main()
