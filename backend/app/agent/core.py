@@ -85,7 +85,6 @@ def run_agent_cycle():
                 return
             logger.warning("SQUARE OFF time reached! Closing all open positions.")
             for pos in open_positions:
-                # --- BUG FIX: Add .NS suffix to find the price data ---
                 symbol_ns = f"{pos.symbol}.NS"
                 latest_bar_df = pd.read_sql_query(text("SELECT close FROM bars WHERE symbol=:s ORDER BY ts DESC LIMIT 1"), db.bind, params={'s': symbol_ns})
                 if not latest_bar_df.empty:
@@ -97,10 +96,14 @@ def run_agent_cycle():
             return
 
         if not in_window():
-            logger.info(f"Outside trading hours ({settings.TRADE_START_TIME} - {settings.TRADE_END_TIME}). Skipping cycle.")
+            logger.info(f"Outside trading hours. Skipping cycle.")
             return
-            
+        
         all_symbols_state, open_positions = [], {p.symbol: p for p in db.query(Position).all()}
+        
+        # --- NEW: Create a list to hold probabilities for logging ---
+        prob_log = []
+
         for symbol_ns in settings.TICKER_LIST:
             symbol = symbol_ns.replace('.NS', '')
             model_bundle = MODELS.get(symbol)
@@ -115,20 +118,30 @@ def run_agent_cycle():
             latest_row = X.iloc[-1]
             prob_long = model_bundle['model'].predict_proba(latest_row.values.reshape(1, -1))[0, 1]
             
+            # --- NEW: Add the probability to our log list ---
+            prob_log.append((symbol, prob_long))
+
             all_symbols_state.append({
                 "symbol": symbol, "prob": prob_long, "price": float(df['close'].iloc[-1]),
                 "position": open_positions.get(symbol),
             })
         
-        # --- Exit Logic ---
+        # --- NEW: Log the probabilities for this cycle ---
+        if prob_log:
+            # Sort by probability, highest first
+            prob_log.sort(key=lambda x: x[1], reverse=True)
+            # Create a clean log string
+            log_str = " | ".join([f"{sym}: {prob:.2f}" for sym, prob in prob_log[:5]]) # Log top 5
+            max_prob = prob_log[0][1]
+            logger.info(f"Model Probs (Top 5): {log_str} | Max: {max_prob:.2f}")
+
+        # --- Exit Logic (no changes) ---
         for state in all_symbols_state:
             pos = state["position"]
             if not pos: continue
-
             entry_time = agent_state["last_entry_time"].get(pos.symbol)
             if entry_time and (now_utc - entry_time) < timedelta(minutes=settings.MIN_HOLD_MINUTES):
                 continue
-
             price = state["price"]; avg_price = float(pos.avg_price)
             if price >= avg_price * (1 + settings.TAKE_PROFIT_PCT):
                 close_trade(db, pos, price, "TAKE PROFIT")
@@ -138,7 +151,7 @@ def run_agent_cycle():
                 close_trade(db, pos, price, "MODEL EXIT")
         db.commit()
         
-        # --- Entry Logic ---
+        # --- Entry Logic (no changes) ---
         candidates = []
         for state in all_symbols_state:
             cooldown_time = agent_state["symbol_cooldowns"].get(state["symbol"])
@@ -147,7 +160,7 @@ def run_agent_cycle():
                 candidates.append(state)
         
         if not candidates:
-            logger.info("No valid entry candidates found.")
+            logger.info("No valid entry candidates found (Prob < 0.65).")
             return
 
         p_max = max(c['prob'] for c in candidates)
