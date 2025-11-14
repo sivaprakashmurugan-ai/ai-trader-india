@@ -14,7 +14,7 @@ from . import features
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-FEAT_COLS = ["ret_1", "rsi_14", "ma_5", "ma_20", "vwap"]
+FEAT_COLS = ["ret_1", "ret_5", "rsi_14", "ma_5", "ma_20", "vwap", "atr14_pct", "adx14"]
 
 def train_symbol(db, symbol: str):
     logger.info(f"--- Training for {symbol} ---")
