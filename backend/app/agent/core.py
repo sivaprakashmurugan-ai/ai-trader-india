@@ -39,13 +39,11 @@ def _time_obj(hm: str): return dt_time.fromisoformat(hm)
 
 def in_window():
     now_time = ist_now().time()
-    # --- FIX: Use the correct long names from settings ---
     start = _time_obj(settings.TRADE_START_TIME)
     end = _time_obj(settings.TRADE_END_TIME)
     return start <= now_time <= end
 
 def should_square_off():
-    # --- FIX: Use the correct long name from settings ---
     return ist_now().time() >= _time_obj(settings.SQUARE_OFF_TIME)
 
 def close_trade(db: Session, pos: Position, exit_price: float, reason: str):
@@ -78,9 +76,7 @@ def run_agent_cycle():
     db = SessionLocal()
     try:
         now_utc = datetime.utcnow()
-        now_ist = ist_now()
 
-        # --- Handle Square Off ---
         if should_square_off():
             open_positions = db.query(Position).all()
             if not open_positions:
@@ -89,20 +85,21 @@ def run_agent_cycle():
                 return
             logger.warning("SQUARE OFF time reached! Closing all open positions.")
             for pos in open_positions:
-                latest_bar = pd.read_sql_query(text("SELECT close FROM bars WHERE symbol=:s ORDER BY ts DESC LIMIT 1"), db.bind, params={'s': pos.symbol}).iloc[0]
-                close_trade(db, pos, float(latest_bar['close']), "SQUARE OFF")
+                # --- BUG FIX: Add .NS suffix to find the price data ---
+                symbol_ns = f"{pos.symbol}.NS"
+                latest_bar_df = pd.read_sql_query(text("SELECT close FROM bars WHERE symbol=:s ORDER BY ts DESC LIMIT 1"), db.bind, params={'s': symbol_ns})
+                if not latest_bar_df.empty:
+                    close_trade(db, pos, float(latest_bar_df['close'].iloc[0]), "SQUARE OFF")
+                else:
+                    logger.error(f"Could not find latest bar for {symbol_ns} during square off. Position remains.")
             db.commit()
             agent_state["stop_trading_today"] = True
             return
 
-        # --- Handle Trading Window ---
         if not in_window():
             logger.info(f"Outside trading hours ({settings.TRADE_START_TIME} - {settings.TRADE_END_TIME}). Skipping cycle.")
             return
             
-        # ... (Full trading logic continues here) ...
-        # (This is the complete, correct logic as developed previously)
-        
         all_symbols_state, open_positions = [], {p.symbol: p for p in db.query(Position).all()}
         for symbol_ns in settings.TICKER_LIST:
             symbol = symbol_ns.replace('.NS', '')
@@ -130,7 +127,7 @@ def run_agent_cycle():
 
             entry_time = agent_state["last_entry_time"].get(pos.symbol)
             if entry_time and (now_utc - entry_time) < timedelta(minutes=settings.MIN_HOLD_MINUTES):
-                continue # Skip exit checks if within min-hold period
+                continue
 
             price = state["price"]; avg_price = float(pos.avg_price)
             if price >= avg_price * (1 + settings.TAKE_PROFIT_PCT):
@@ -169,7 +166,6 @@ def run_agent_cycle():
                 alloc = max(settings.MIN_TRADE_VALUE, min(alloc, settings.MAX_TRADE_VALUE_PER_SYMBOL))
                 qty = int(alloc / c['price'])
                 cost = qty * c['price']
-
                 if qty > 0 and agent_state["cash"] >= cost:
                     logger.info(f"[ENTRY] BUY {qty} x {c['symbol']} @ {c['price']:.2f}")
                     db.add(Position(symbol=c['symbol'], quantity=qty, avg_price=c['price'], entry_time=now_utc))
@@ -187,7 +183,7 @@ def run_agent_cycle():
 
 if __name__ == "__main__":
     logger.info("--- AI Trading Agent Starting ---")
-    time.sleep(15) # Initial delay
+    time.sleep(15)
     while True:
         run_agent_cycle()
         time.sleep(settings.AGENT_LOOP_SLEEP_SECONDS)
