@@ -14,10 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # --- Backtester Configuration ---
-# Use the same database as the live system
 engine = create_engine(settings.DATABASE_URL)
-
-# Load the same models the live agent uses
 try:
     MODEL_BUNDLE = joblib.load("app/models/model.pkl")
     MODELS = MODEL_BUNDLE["models"]
@@ -32,110 +29,105 @@ def run_backtest(start_date: str, end_date: str):
     """
     logger.info(f"--- Starting Backtest from {start_date} to {end_date} ---")
     
-    # 1. Load all necessary historical data into memory
+    # 1. Load Data (No changes here)
     logger.info("Loading all historical bars for the backtest period...")
-    query = text("""
-        SELECT * FROM bars 
-        WHERE ts >= :start AND ts < :end 
-        ORDER BY ts ASC
-    """)
+    query = text("SELECT * FROM bars WHERE ts >= :start AND ts < :end ORDER BY ts ASC")
     all_bars = pd.read_sql_query(query, engine, params={'start': start_date, 'end': end_date})
     if all_bars.empty:
         logger.error("No historical data found for the specified date range. Exiting.")
         return
-
-    # Prepare data by creating a dictionary of DataFrames, one for each symbol
     data_by_symbol = {symbol: df.copy() for symbol, df in all_bars.groupby('symbol')}
-    
-    # Get a sorted list of all unique timestamps to drive the simulation
     all_timestamps = sorted(all_bars['ts'].unique())
     logger.info(f"Loaded {len(all_bars)} bars across {len(data_by_symbol)} symbols, with {len(all_timestamps)} unique timestamps.")
 
-    # 2. Initialize backtest state variables
+    # 2. Initialize State
     cash = settings.DAILY_BUDGET
-    positions = {} # { 'symbol': {'qty': 10, 'avg_price': 1500.0} }
+    # --- UPGRADE: Add new fields to the position dictionary for trailing stops ---
+    positions = {} # { 'symbol': {'qty': 10, 'avg_price': 1500.0, 'high_water_mark': 1510.0, 'ts_active': False} }
     completed_trades = []
     pnl_history = []
 
     # 3. Main Simulation Loop
     logger.info("Starting simulation loop...")
     for i, ts in enumerate(all_timestamps):
-        if i % 100 == 0: # Log progress periodically
+        if i % 100 == 0:
             logger.info(f"Simulating timestamp {i+1}/{len(all_timestamps)}: {pd.to_datetime(ts).strftime('%Y-%m-%d %H:%M')}")
 
-        current_pnl = 0
-        all_symbol_states = []
+        all_symbol_states = [] # This needs to be inside the loop to reset each timestamp
 
         for symbol_ns, symbol_df in data_by_symbol.items():
-            # Get all data for this symbol up to the current simulated time
             current_data = symbol_df[symbol_df['ts'] <= ts]
-            if len(current_data) < 200:
-                continue # Not enough history to generate features
-
-            # Get the current bar
+            if len(current_data) < 200: continue
+            
             current_bar = current_data.iloc[-1]
             price = float(current_bar['close'])
-
-            # --- This is the CORE AGENT LOGIC, replicated for backtesting ---
             plain_symbol = symbol_ns.replace('.NS', '')
-            model_bundle = MODELS.get(plain_symbol)
-            if not model_bundle:
-                continue
 
-            # Generate features for the current bar
-            feature_df = features.make_features(current_data)
-            if feature_df.empty:
-                continue
-            
-            latest_features = feature_df.iloc[-1]
-            prob_long = model_bundle['model'].predict_proba(latest_features.values.reshape(1, -1))[0, 1]
-
-            # Check exit conditions for any open position
+            # --- UPGRADE: Implement Trailing Stop Logic ---
             if plain_symbol in positions:
                 pos = positions[plain_symbol]
                 avg_price = pos['avg_price']
                 
-                # Simple exit logic (can be expanded)
-                if price >= avg_price * (1 + settings.TAKE_PROFIT_PCT) or price <= avg_price * (1 - settings.STOP_LOSS_PCT):
+                # Update the highest price seen since entry
+                pos['high_water_mark'] = max(pos.get('high_water_mark', price), price)
+
+                # Activate the trailing stop if profit target is hit
+                if not pos.get('ts_active', False) and price >= avg_price * (1 + settings.TRAILING_STOP_ACTIVATION_PCT):
+                    pos['ts_active'] = True
+                    logger.info(f"[{pd.to_datetime(ts).strftime('%H:%M')}] Trailing Stop ACTIVATED for {plain_symbol} at {price:.2f}")
+
+                # Check for exit via Trailing Stop
+                if pos.get('ts_active', False):
+                    trailing_stop_price = pos['high_water_mark'] * (1 - settings.TRAILING_STOP_TRAIL_PCT)
+                    if price <= trailing_stop_price:
+                        pnl = (price - avg_price) * pos['qty']
+                        completed_trades.append({'symbol': plain_symbol, 'pnl': pnl, 'reason': 'Trailing Stop'})
+                        cash += price * pos['qty']
+                        del positions[plain_symbol]
+                        logger.info(f"[{pd.to_datetime(ts).strftime('%H:%M')}] EXIT {plain_symbol} via TRAILING STOP at {price:.2f}, PnL: {pnl:.2f}")
+                        continue # Skip to the next symbol as we have closed this one
+
+                # Check for exit via Hard Stop-Loss (only if trailing stop is not active)
+                if not pos.get('ts_active', False) and price <= avg_price * (1 - settings.STOP_LOSS_PCT):
                     pnl = (price - avg_price) * pos['qty']
-                    completed_trades.append({'symbol': plain_symbol, 'pnl': pnl})
+                    completed_trades.append({'symbol': plain_symbol, 'pnl': pnl, 'reason': 'Hard Stop'})
                     cash += price * pos['qty']
                     del positions[plain_symbol]
-                    logger.info(f"[{pd.to_datetime(ts).strftime('%H:%M')}] EXIT {plain_symbol} at {price:.2f}, PnL: {pnl:.2f}")
+                    logger.info(f"[{pd.to_datetime(ts).strftime('%H:%M')}] EXIT {plain_symbol} via HARD STOP at {price:.2f}, PnL: {pnl:.2f}")
+                    continue
 
+            # This part of your logic for generating signals is unchanged
+            model_bundle = MODELS.get(plain_symbol)
+            if not model_bundle: continue
+            feature_df = features.make_features(current_data)
+            if feature_df.empty: continue
+            latest_features = feature_df.iloc[-1]
+            prob_long = model_bundle['model'].predict_proba(latest_features.values.reshape(1, -1))[0, 1]
             all_symbol_states.append({
-                "symbol": plain_symbol,
-                "prob": prob_long,
-                "price": price,
-                "has_position": plain_symbol in positions
+                "symbol": plain_symbol, "prob": prob_long,
+                "price": price, "has_position": plain_symbol in positions
             })
 
-        # --- Entry Logic (simplified for backtesting) ---
+        # Entry Logic (Unchanged)
         candidates = [s for s in all_symbol_states if s['prob'] >= settings.PROB_THRESHOLD_BUY and not s['has_position']]
         if candidates:
-            # Simple logic: buy the highest probability candidate
             best_candidate = max(candidates, key=lambda c: c['prob'])
             symbol_to_buy = best_candidate['symbol']
             price = best_candidate['price']
-            
-            # Position sizing
             alloc = cash * settings.POSITION_ENTRY_PCT
             qty = int(alloc / price)
-
             if qty > 0 and cash >= qty * price:
-                positions[symbol_to_buy] = {'qty': qty, 'avg_price': price}
+                # --- UPGRADE: Add trailing stop fields to new position ---
+                positions[symbol_to_buy] = {'qty': qty, 'avg_price': price, 'high_water_mark': price, 'ts_active': False}
                 cash -= qty * price
                 logger.info(f"[{pd.to_datetime(ts).strftime('%H:%M')}] ENTRY {symbol_to_buy} x{qty} at {price:.2f} (prob={best_candidate['prob']:.2f})")
 
-        # Record daily PnL
+        # PnL Recording (Unchanged)
         realized_pnl = sum(t['pnl'] for t in completed_trades)
         unrealized_pnl = 0
         for symbol, pos in positions.items():
-            # Find the latest price for the unrealized PnL calculation
-            latest_price_df = data_by_symbol[f"{symbol}.NS"]
-            latest_price = latest_price_df[latest_price_df['ts'] == ts]['close'].iloc[0]
+            latest_price = data_by_symbol[f"{symbol}.NS"][data_by_symbol[f"{symbol}.NS"]['ts'] == ts]['close'].iloc[0]
             unrealized_pnl += (latest_price - pos['avg_price']) * pos['qty']
-        
         pnl_history.append(realized_pnl + unrealized_pnl)
 
     logger.info("Simulation loop finished.")
@@ -172,11 +164,9 @@ def run_backtest(start_date: str, end_date: str):
     print(f"Max Drawdown:               ₹{max_drawdown:,.2f}")
     print("----------------------------------\n")
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run a backtest of the trading agent.")
-    parser.add_argument("--start-date", required=True, help="Start date in YYYY-MM-DD format.")
-    parser.add_argument("--end-date", required=True, help="End date in YYYY-MM-DD format.")
+    parser.add_argument("--start-date", default="2025-11-03", help="Start date in YYYY-MM-DD format.")
+    parser.add_argument("--end-date", default="2025-11-08", help="End date in YYYY-MM-DD format.")
     args = parser.parse_args()
-    
     run_backtest(args.start_date, args.end_date)
