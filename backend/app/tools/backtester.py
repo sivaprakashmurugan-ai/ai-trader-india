@@ -140,21 +140,27 @@ def run_backtest(start_date: str, end_date: str):
 
     logger.info("Simulation loop finished.")
 
-    # 4. Calculate and Print Performance Report
+    # 4. Final Report (with upgrades)
     total_pnl = pnl_history[-1] if pnl_history else 0
     num_trades = len(completed_trades)
     wins = [t for t in completed_trades if t['pnl'] > 0]
     win_rate = (len(wins) / num_trades) * 100 if num_trades > 0 else 0
-    
-    # Calculate Max Drawdown
-    peak = 0
-    max_drawdown = 0
+    peak, max_drawdown = 0, 0
     for pnl in pnl_history:
-        if pnl > peak:
-            peak = pnl
+        if pnl > peak: peak = pnl
         drawdown = peak - pnl
-        if drawdown > max_drawdown:
-            max_drawdown = drawdown
+        if drawdown > max_drawdown: max_drawdown = drawdown
+
+    # --- UPGRADE: Add the individual trade log to the report ---
+    print("\n--- INDIVIDUAL TRADE LOG ---")
+    if not completed_trades:
+        print("No trades were executed.")
+    else:
+        # Create a DataFrame for easy viewing and sorting
+        trade_log_df = pd.DataFrame(completed_trades)
+        trade_log_df = trade_log_df.sort_values(by='pnl', ascending=False)
+        for _, trade in trade_log_df.iterrows():
+            print(f"  - Symbol: {trade['symbol']:<12} | PnL: ₹{trade['pnl']:>8.2f} | Exit Reason: {trade['reason']}")
 
     print("\n--- BACKTEST PERFORMANCE REPORT ---")
     print(f"Period:                     {start_date} to {end_date}")

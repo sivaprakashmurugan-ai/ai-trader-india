@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     DOMINANCE_GAP: float = 0.1
     TAKE_PROFIT_PCT: float = 0.012
     STOP_LOSS_PCT: float = 0.006
+    TRAILING_STOP_ACTIVATION_PCT: float = 0.01
+    TRAILING_STOP_TRAIL_PCT: float = 0.005
     MIN_HOLD_MINUTES: int = 10
     COOLDOWN_MINUTES_AFTER_EXIT: int = 15
     MAX_TRADES_PER_DAY: int = 25
